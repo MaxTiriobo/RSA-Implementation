@@ -1,0 +1,255 @@
+import secrets
+import hashlib
+
+"""
+===========================================
+Math / Helper Functions
+===========================================
+"""
+class MathFunction:
+    @staticmethod
+    def gcd(a, b):
+        while b != 0:
+            a, b = b, a % b
+        return a
+
+    @staticmethod
+    def extended_gcd(a, b):
+        x0, y0, x1, y1 = 1, 0, 0, 1
+        while b != 0:
+            q, r = divmod(a, b)
+            a, b = b, r
+            x0, x1 = x1, x0 - q * x1
+            y0, y1 = y1, y0 - q * y1
+        return a, x0, y0
+
+    @staticmethod
+    def mod_inverse(e, phi_n):
+        g, x, y = MathFunction.extended_gcd(e, phi_n)
+        if g != 1:
+            raise Exception("No Modular Inverse exists")
+        return x % phi_n
+
+    @staticmethod
+    def repeated_squaring(base, exponent, modulus):
+        result = 1
+        base %= modulus
+        while exponent > 0:
+            if exponent % 2 == 1:
+                result = (result * base) % modulus
+            base = (base * base) % modulus
+            exponent //= 2
+        return result
+
+"""
+===========================================
+Prime Generation
+===========================================
+"""
+class Prime_Generation:
+    @staticmethod
+    def miller_rabin(n, k=40):
+        if n < 2: return False
+        if n in (2, 3): return True
+        if n % 2 == 0: return False
+
+        r, d = 0, n - 1
+        while d % 2 == 0:
+            r += 1
+            d //= 2
+
+        for _ in range(k):
+            a = secrets.randbelow(n - 3) + 2
+            x = pow(a, d, n)
+            if x in (1, n - 1):
+                continue
+            for _ in range(r - 1):
+                x = pow(x, 2, n)
+                if x == n - 1:
+                    break
+            else:
+                return False
+        return True
+
+    @staticmethod
+    def generate_prime(bits):
+        while True:
+            candidate = secrets.randbits(bits) | (1 << (bits - 1)) | 1
+            if Prime_Generation.miller_rabin(candidate):
+                return candidate
+
+    @staticmethod
+    def generate_rsa_primes(bits=512):
+        p = Prime_Generation.generate_prime(bits)
+        q = Prime_Generation.generate_prime(bits)
+        while q == p:
+            q = Prime_Generation.generate_prime(bits)
+        return p, q
+
+
+"""
+===========================================
+Key Generation
+===========================================
+"""
+class Key_Generation:
+    def __init__(self, bits=512):
+        self.p, self.q = Prime_Generation.generate_rsa_primes(bits)
+        self.n = self.p * self.q
+        self.phi = (self.p - 1) * (self.q - 1)
+
+        # Generate e
+        while True:
+            e = secrets.randbelow(self.phi - 2) + 2
+            if MathFunction.gcd(e, self.phi) == 1:
+                self.e = e
+                break
+
+        self.d = MathFunction.mod_inverse(self.e, self.phi)
+
+    def public_key(self):
+        return (self.e, self.n)
+
+    def private_key(self):
+        return (self.d, self.n)
+
+"""
+===========================================
+OAEP Padding / Depadding
+===========================================
+"""
+class OAEP:
+    @staticmethod
+    def mgf1(seed: bytes, length: int, hash_alg=hashlib.sha256):
+        hLen = hash_alg().digest_size
+        mask = b""
+        counter = 0
+        while len(mask) < length:
+            C = counter.to_bytes(4, 'big')
+            mask += hash_alg(seed + C).digest()
+            counter += 1
+        return mask[:length]
+
+    @staticmethod
+    def encode(message: bytes, k: int, hash_alg=hashlib.sha256):
+        hLen = hash_alg().digest_size
+        mLen = len(message)
+        if mLen > (k - 2 * hLen - 2):
+            raise ValueError("Message too long for OAEP padding")
+
+        lHash = hash_alg(b"").digest()
+        padding_len = k - mLen - 2 * hLen - 2
+        padding = b"\x00" * padding_len
+
+        DB = lHash + padding + b"\x01" + message
+        seed = secrets.token_bytes(hLen)
+
+        dbMask = OAEP.mgf1(seed, len(DB), hash_alg)
+        maskedDB = bytes(a ^ b for a, b in zip(DB, dbMask))
+
+        seedMask = OAEP.mgf1(maskedDB, hLen, hash_alg)
+        maskedSeed = bytes(a ^ b for a, b in zip(seed, seedMask))
+
+        return b"\x00" + maskedSeed + maskedDB
+
+    @staticmethod
+    def decode(em: bytes, hash_alg=hashlib.sha256):
+        hLen = hash_alg().digest_size
+        Y = em[0]
+        if Y != 0:
+            raise ValueError("Incorrect OAEP block")
+
+        maskedSeed = em[1:1 + hLen]
+        maskedDB = em[1 + hLen:]
+
+        seedMask = OAEP.mgf1(maskedDB, hLen, hash_alg)
+        seed = bytes(a ^ b for a, b in zip(maskedSeed, seedMask))
+
+        dbMask = OAEP.mgf1(seed, len(maskedDB), hash_alg)
+        DB = bytes(a ^ b for a, b in zip(maskedDB, dbMask))
+
+        lHash = DB[:hLen]
+        DB_rest = DB[hLen:]
+
+        sep_index = DB_rest.find(b"\x01")
+        if sep_index == -1:
+            raise ValueError("Invalid OAEP block")
+
+        return DB_rest[sep_index + 1:]
+
+
+"""
+===========================================
+String to Int // Int to String
+===========================================
+"""
+class StringConverter:
+    @staticmethod
+    def str_to_int(s, length):
+        b = s.encode("utf-8")
+        if len(b) > length:
+            raise ValueError("Message too long for RSA modulus")
+        return int.from_bytes(b.rjust(length, b'\x00'), 'big')
+
+    @staticmethod
+    def int_to_str(n, length):
+        b = n.to_bytes(length, 'big')
+        return b.lstrip(b'\x00').decode("utf-8")
+
+
+"""
+===========================================
+RSA Encryption/Decryption
+===========================================
+"""
+class RSA:
+    def __init__(self, key: Key_Generation):
+        self.key = key
+        self.k = (self.key.n.bit_length() + 7) // 8
+
+    def encrypt(self, message: str):
+        padded = OAEP.encode(message.encode(), self.k)
+        m_int = int.from_bytes(message, 'big')
+        c = MathFunction.repeated_squaring(m_int, self.key.e, self.key.n)
+        return c
+
+    def decrypt(self, ciphertext: int):
+        m_int = MathFunction.repeated_squaring(ciphertext, self.key.d, self.key.n)
+        m_bytes = m_int.to_bytes(self.k, 'big')
+        decoded = OAEP.decode(m_bytes)
+        return decoded.decode("utf-8")
+
+
+
+"""
+===========================================
+Example
+===========================================
+"""
+if __name__ == "__main__":
+    key = Key_Generation(bits=512)
+    rsa = RSA(key)
+
+    print("Public Key:", key.public_key())
+    print("Private Key:", key.private_key())
+
+    # Original message
+    m = str(input("\n what message do you want encrypted?: "))
+    print("\nOriginal message: ", m)
+
+    # OAEP padded message
+    padded = OAEP.encode(m.encode(), rsa.k)
+    print("\nMessage with OAEP padding:", padded)
+
+    # RSA encrypted (on OAEP padded)
+    m_int = int.from_bytes(padded, 'big')
+    encrypted = MathFunction.repeated_squaring(m_int, key.e, key.n)
+    print("\nMessage m with OAEP padding and RSA encryption:", encrypted)
+
+    # Decrypt back
+    decrypted_int = MathFunction.repeated_squaring(encrypted, key.d, key.n)
+    decrypted_bytes = decrypted_int.to_bytes(rsa.k, 'big')
+    decrypted = OAEP.decode(decrypted_bytes).decode('utf-8')
+
+    print("\nDecrypted message: ", decrypted)
+
